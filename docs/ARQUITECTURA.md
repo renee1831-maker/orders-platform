@@ -4,34 +4,35 @@
 
 ```mermaid
 flowchart LR
-  dev([Desarrollador]) -- git push --> repo[(GitHub<br/>orders-platform)]
-  repo -- evento push a main --> gha
+  dev(["Desarrollador"]) -->|"git push"| repo[("GitHub<br/>orders-platform")]
+  repo -->|"evento push a main"| j1
 
-  subgraph gha[GitHub Actions · workflow CI/CD]
+  subgraph gha["GitHub Actions - workflow CI/CD"]
     direction LR
-    j1[Build and test<br/>ruff · mypy · cfn-lint · pytest] --> j2[Deploy staging<br/>EB + smoke test full]
-    j2 --> j3{Aprobación manual<br/>entorno production}
-    j3 --> j4[Deploy production<br/>EB Immutable + smoke read-only]
+    j1["Build and test<br/>ruff, mypy, cfn-lint, pytest"] --> j2["Deploy staging<br/>EB + smoke test full"]
+    j2 --> j3{"Aprobación manual<br/>entorno production"}
+    j3 --> j4["Deploy production<br/>EB Immutable + smoke read-only"]
   end
 
-  j1 -. reportes JUnit / cobertura / app-bundle.zip .-> art[Artefactos de GitHub]
-  j2 -- ZIP de la versión --> s3[(S3 artefactos)]
-  s3 --> ver[EB Application Versions]
+  j1 -.->|"reportes JUnit, cobertura, app-bundle.zip"| art["Artefactos de GitHub"]
+  j2 -->|"ZIP de la versión"| s3[("S3 artefactos")]
+  s3 --> ver["EB Application Versions"]
 
-  subgraph aws[AWS Academy Sandbox · us-east-1 · stack orders-platform-infra]
-    subgraph stg[Entorno staging]
-      ebs[Elastic Beanstalk<br/>EC2 t3.micro · gunicorn+uvicorn] --> ddbs[(DynamoDB<br/>orders-staging)]
+  subgraph aws["AWS Academy Sandbox - us-east-1 - stack orders-platform-infra"]
+    subgraph stg["Entorno staging"]
+      ebs["Elastic Beanstalk<br/>EC2 t3.micro, gunicorn + uvicorn"] --> ddbs[("DynamoDB<br/>orders-staging")]
     end
-    subgraph prd[Entorno producción]
-      ebp[Elastic Beanstalk<br/>Single o ALB + ASG 2-4] --> ddbp[(DynamoDB<br/>orders-production · PITR)]
+    subgraph prd["Entorno producción"]
+      ebp["Elastic Beanstalk<br/>Single o ALB + ASG 2-4"] --> ddbp[("DynamoDB<br/>orders-production, PITR")]
     end
-    cw[Amazon CloudWatch<br/>Logs + salud enhanced]
+    cw["Amazon CloudWatch<br/>Logs + salud enhanced"]
   end
 
   ver --> ebs
   ver --> ebp
-  ebs & ebp -- logs JSON / health --> cw
-  usr([Cliente API]) -- HTTP REST --> ebp
+  ebs -->|"logs JSON, health"| cw
+  ebp -->|"logs JSON, health"| cw
+  usr(["Cliente API"]) -->|"HTTP REST"| ebp
 ```
 
 ## Decisiones y alternativas evaluadas
