@@ -1,0 +1,72 @@
+# CI: lint + tipado estricto + pruebas con cobertura + empaquetado del artefacto para Elastic Beanstalk.
+version: 0.2
+
+env:
+  variables:
+    PIP_CACHE_DIR: "/root/.cache/pip"
+    PYTHONDONTWRITEBYTECODE: "1"
+    MIN_COVERAGE: "85"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - python --version
+      - pip install --upgrade pip
+      - pip install -r requirements-dev.txt
+
+  pre_build:
+    commands:
+      - echo "== Análisis estático =="
+      - ruff check app tests
+      - ruff format --check app tests
+      - mypy
+      - cfn-lint infra/*.yaml
+
+  build:
+    commands:
+      - echo "== Pruebas unitarias, de API e integración =="
+      - mkdir -p reports
+      - >
+        pytest
+        --junitxml=reports/junit.xml
+        --cov=app
+        --cov-report=xml:reports/coverage.xml
+        --cov-report=term
+        --cov-fail-under=$MIN_COVERAGE
+
+  post_build:
+    commands:
+      # post_build se ejecuta aunque build falle: no empaquetar si hubo error.
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+          COMMIT="${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}"
+          printf '{"commit":"%s","build_id":"%s","built_at":"%s"}\n' \
+            "$COMMIT" "$CODEBUILD_BUILD_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > app/build_info.json
+          cat app/build_info.json
+          find app -type d -name "__pycache__" -prune -exec rm -rf {} +
+        fi
+
+reports:
+  unit-tests:
+    files:
+      - junit.xml
+    base-directory: reports
+    file-format: JUNITXML
+  coverage:
+    files:
+      - coverage.xml
+    base-directory: reports
+    file-format: COBERTURAXML
+
+artifacts:
+  # Solo lo necesario en runtime: sin pruebas, sin dependencias de desarrollo.
+  files:
+    - app/**/*
+    - Procfile
+    - requirements.txt
+
+cache:
+  paths:
+    - "/root/.cache/pip/**/*"

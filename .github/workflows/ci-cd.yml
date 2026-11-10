@@ -1,0 +1,194 @@
+# CI/CD de la plataforma de pedidos.
+#
+#   push a main ─► CI (lint, tipado, IaC lint, pruebas, empaquetado)
+#               ─► Deploy staging (Elastic Beanstalk) + smoke test completo
+#               ─► Aprobación manual (entorno "production" con revisores obligatorios)
+#               ─► Deploy producción (Immutable, mismo artefacto) + smoke test de solo lectura
+#
+# Los pull requests solo ejecutan la CI.
+# Secrets requeridos (credenciales temporales del laboratorio AWS Academy, se renuevan cada sesión):
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: orders-platform
+  PYTHON_VERSION: "3.12"
+  MIN_COVERAGE: "85"
+
+jobs:
+  ci:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version_label: ${{ steps.meta.outputs.version_label }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Análisis estático (ruff, mypy --strict, cfn-lint)
+        run: |
+          ruff check app tests scripts
+          ruff format --check app tests scripts
+          mypy
+          cfn-lint infra/*.yaml
+
+      - name: Pruebas unitarias, de API e integración
+        run: |
+          mkdir -p reports
+          pytest \
+            --junitxml=reports/junit.xml \
+            --cov=app \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-report=term \
+            --cov-fail-under=$MIN_COVERAGE
+
+      - name: Resumen de pruebas
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import pathlib
+          import xml.etree.ElementTree as ET
+          junit = pathlib.Path("reports/junit.xml")
+          cov = pathlib.Path("reports/coverage.xml")
+          print("## Resultados de CI")
+          if junit.exists():
+              s = ET.parse(junit).getroot()
+              s = s.find("testsuite") if s.tag == "testsuites" else s
+              total, fail, err, skip = (int(s.get(k, 0)) for k in ("tests", "failures", "errors", "skipped"))
+              print(f"- Pruebas: **{total - fail - err - skip} aprobadas** de {total} (fallos {fail}, errores {err})")
+          if cov.exists():
+              rate = float(ET.parse(cov).getroot().get("line-rate", 0)) * 100
+              print(f"- Cobertura de líneas: **{rate:.1f} %** (mínimo ${{ env.MIN_COVERAGE }} %)")
+          PY
+
+      - name: Publicar reportes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: reports/
+          if-no-files-found: ignore
+
+      - name: Metadatos de build
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "version_label=gh-${SHORT_SHA}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          printf '{"commit":"%s","build_id":"github-%s-%s","built_at":"%s"}\n' \
+            "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > app/build_info.json
+          cat app/build_info.json
+
+      - name: Empaquetar artefacto para Elastic Beanstalk
+        run: |
+          find app -type d -name "__pycache__" -prune -exec rm -rf {} +
+          zip -r app-bundle.zip app Procfile requirements.txt -x "*.pyc"
+          unzip -l app-bundle.zip | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-bundle
+          path: app-bundle.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy-staging:
+    name: Deploy staging
+    needs: ci
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: staging
+      url: ${{ steps.deploy.outputs.url }}/docs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-bundle
+
+      - name: Credenciales AWS (laboratorio)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Desplegar en Elastic Beanstalk (staging)
+        id: deploy
+        run: |
+          bash scripts/eb_deploy.sh \
+            --env "${PROJECT_NAME}-staging" \
+            --label "${{ needs.ci.outputs.version_label }}" \
+            --bundle app-bundle.zip \
+            --description "${GITHUB_SHA::7} $(git log -1 --pretty=%s)"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Smoke test (completo)
+        run: python scripts/smoke_test.py --url "${{ steps.deploy.outputs.url }}" --mode full
+
+  deploy-production:
+    name: Deploy production
+    needs: [ci, deploy-staging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Configure revisores obligatorios en Settings → Environments → production:
+    # el job queda en espera hasta que alguien pulse "Approve and deploy".
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}/health
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Credenciales AWS (laboratorio)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Promover a producción (misma versión probada en staging)
+        id: deploy
+        run: |
+          bash scripts/eb_deploy.sh \
+            --env "${PROJECT_NAME}-production" \
+            --label "${{ needs.ci.outputs.version_label }}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Smoke test (solo lectura)
+        run: python scripts/smoke_test.py --url "${{ steps.deploy.outputs.url }}" --mode read-only

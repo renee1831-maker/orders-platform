@@ -1,0 +1,502 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Plataforma de gestión de pedidos - CI/CD completo:
+  CodeCommit/GitHub -> CodePipeline -> CodeBuild (CI) -> Elastic Beanstalk staging ->
+  smoke test -> aprobación manual -> Elastic Beanstalk producción -> smoke test.
+  Diseñada para AWS Academy (sin creación de roles IAM: reutiliza LabRole / LabInstanceProfile).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Proyecto" }
+        Parameters: [ProjectName, NotificationEmail]
+      - Label: { default: "Roles del laboratorio (AWS Academy)" }
+        Parameters: [LabRoleName, LabInstanceProfileName]
+      - Label: { default: "Código fuente" }
+        Parameters: [SourceProvider, BranchName, GitHubConnectionArn, GitHubRepository]
+      - Label: { default: "Cómputo" }
+        Parameters: [SolutionStackName, InstanceType, ProductionEnvironmentType]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: orders-platform
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"
+    Description: Prefijo de todos los recursos (minúsculas, números y guiones).
+  LabRoleName:
+    Type: String
+    Default: LabRole
+  LabInstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+  SourceProvider:
+    Type: String
+    Default: CodeCommit
+    AllowedValues: [CodeCommit, GitHub]
+  BranchName:
+    Type: String
+    Default: main
+  GitHubConnectionArn:
+    Type: String
+    Default: ""
+    Description: Solo si SourceProvider=GitHub. Conexión de CodeConnections ya autorizada.
+  GitHubRepository:
+    Type: String
+    Default: ""
+    Description: Solo si SourceProvider=GitHub. Formato propietario/repositorio.
+  SolutionStackName:
+    Type: String
+    Description: >-
+      Plataforma EB exacta, p. ej. "64bit Amazon Linux 2023 v4.x.y running Python 3.12".
+      scripts/deploy_infra.sh la resuelve automáticamente.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t2.micro]
+  ProductionEnvironmentType:
+    Type: String
+    Default: SingleInstance
+    AllowedValues: [SingleInstance, LoadBalanced]
+    Description: LoadBalanced crea un ALB y Auto Scaling (2-4 instancias) en producción.
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Opcional. Correo para aprobaciones y resultados del pipeline.
+
+Conditions:
+  UseCodeCommit: !Equals [!Ref SourceProvider, CodeCommit]
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  ProdIsLoadBalanced: !Equals [!Ref ProductionEnvironmentType, LoadBalanced]
+
+Rules:
+  GitHubRequiresConnection:
+    RuleCondition: !Equals [!Ref SourceProvider, GitHub]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref GitHubConnectionArn, ""]]
+        AssertDescription: GitHubConnectionArn es obligatorio cuando SourceProvider=GitHub.
+      - Assert: !Not [!Equals [!Ref GitHubRepository, ""]]
+        AssertDescription: GitHubRepository es obligatorio cuando SourceProvider=GitHub.
+
+Resources:
+  # ------------------------------------------------------------------ Artefactos
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-pipeline-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub "${ArtifactBucket.Arn}/*"
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  # ------------------------------------------------------------------ Código fuente
+  SourceRepository:
+    Type: AWS::CodeCommit::Repository
+    Condition: UseCodeCommit
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-repo"
+      RepositoryDescription: Código de la API de pedidos e infraestructura como código.
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # Dispara el pipeline en cada commit a la rama (evento, no polling).
+  SourceChangeRule:
+    Type: AWS::Events::Rule
+    Condition: UseCodeCommit
+    Properties:
+      Description: Inicia el pipeline con cada push a la rama configurada.
+      EventPattern:
+        source: [aws.codecommit]
+        detail-type: [CodeCommit Repository State Change]
+        resources: [!GetAtt SourceRepository.Arn]
+        detail:
+          event: [referenceCreated, referenceUpdated]
+          referenceType: [branch]
+          referenceName: [!Ref BranchName]
+      Targets:
+        - Id: start-pipeline
+          Arn: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}"
+          RoleArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LabRoleName}"
+
+  # ------------------------------------------------------------------ Datos
+  StagingOrdersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${ProjectName}-orders-staging"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: entity_type, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi_entity_created_at
+          KeySchema:
+            - { AttributeName: entity_type, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: gsi_status_created_at
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      SSESpecification: { SSEEnabled: true }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: staging }
+
+  ProductionOrdersTable:
+    Type: AWS::DynamoDB::Table
+    # Los datos de producción sobreviven a un borrado accidental del stack.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${ProjectName}-orders-production"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: entity_type, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi_entity_created_at
+          KeySchema:
+            - { AttributeName: entity_type, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: gsi_status_created_at
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: production }
+
+  # ------------------------------------------------------------------ Elastic Beanstalk
+  EBApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: !Ref ProjectName
+      Description: API REST de gestión de pedidos (Python / FastAPI)
+      ResourceLifecycleConfig:
+        ServiceRole: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LabRoleName}"
+        VersionLifecycleConfig:
+          MaxCountRule:
+            Enabled: true
+            MaxCount: 20
+            DeleteSourceFromS3: true
+
+  StagingEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref EBApplication
+      EnvironmentName: !Sub "${ProjectName}-staging"
+      CNAMEPrefix: !Sub "${ProjectName}-staging-${AWS::AccountId}"
+      SolutionStackName: !Ref SolutionStackName
+      Tier: { Name: WebServer, Type: Standard }
+      OptionSettings:
+        - { Namespace: "aws:elasticbeanstalk:environment", OptionName: EnvironmentType, Value: SingleInstance }
+        - { Namespace: "aws:elasticbeanstalk:environment", OptionName: ServiceRole, Value: !Ref LabRoleName }
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: IamInstanceProfile, Value: !Ref LabInstanceProfileName }
+        # IMDSv2 + gp3 fuerzan Launch Templates (cuentas nuevas no admiten Launch Configurations).
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: DisableIMDSv1, Value: "true" }
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: RootVolumeType, Value: gp3 }
+        - { Namespace: "aws:ec2:instances", OptionName: InstanceTypes, Value: !Ref InstanceType }
+        - { Namespace: "aws:elasticbeanstalk:command", OptionName: DeploymentPolicy, Value: AllAtOnce }
+        - { Namespace: "aws:elasticbeanstalk:healthreporting:system", OptionName: SystemType, Value: enhanced }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: StreamLogs, Value: "true" }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: RetentionInDays, Value: "7" }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: DeleteOnTerminate, Value: "true" }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs:health", OptionName: HealthStreamingEnabled, Value: "true" }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: APP_ENV, Value: staging }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: REPOSITORY_BACKEND, Value: dynamodb }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: ORDERS_TABLE_NAME, Value: !Ref StagingOrdersTable }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: AWS_REGION, Value: !Ref "AWS::Region" }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: LOG_LEVEL, Value: INFO }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: ENABLE_DOCS, Value: "true" }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: staging }
+
+  ProductionEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref EBApplication
+      EnvironmentName: !Sub "${ProjectName}-production"
+      CNAMEPrefix: !Sub "${ProjectName}-prod-${AWS::AccountId}"
+      SolutionStackName: !Ref SolutionStackName
+      Tier: { Name: WebServer, Type: Standard }
+      OptionSettings:
+        - { Namespace: "aws:elasticbeanstalk:environment", OptionName: EnvironmentType, Value: !Ref ProductionEnvironmentType }
+        - { Namespace: "aws:elasticbeanstalk:environment", OptionName: ServiceRole, Value: !Ref LabRoleName }
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: IamInstanceProfile, Value: !Ref LabInstanceProfileName }
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: DisableIMDSv1, Value: "true" }
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: RootVolumeType, Value: gp3 }
+        - { Namespace: "aws:ec2:instances", OptionName: InstanceTypes, Value: !Ref InstanceType }
+        # Immutable: instancias nuevas en paralelo; si fallan, la versión anterior sigue sirviendo.
+        - { Namespace: "aws:elasticbeanstalk:command", OptionName: DeploymentPolicy, Value: Immutable }
+        - { Namespace: "aws:elasticbeanstalk:healthreporting:system", OptionName: SystemType, Value: enhanced }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: StreamLogs, Value: "true" }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: RetentionInDays, Value: "30" }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs:health", OptionName: HealthStreamingEnabled, Value: "true" }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: APP_ENV, Value: production }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: REPOSITORY_BACKEND, Value: dynamodb }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: ORDERS_TABLE_NAME, Value: !Ref ProductionOrdersTable }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: AWS_REGION, Value: !Ref "AWS::Region" }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: LOG_LEVEL, Value: INFO }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: ENABLE_DOCS, Value: "false" }
+        - !If
+          - ProdIsLoadBalanced
+          - { Namespace: "aws:elasticbeanstalk:environment", OptionName: LoadBalancerType, Value: application }
+          - !Ref "AWS::NoValue"
+        - !If
+          - ProdIsLoadBalanced
+          - { Namespace: "aws:elasticbeanstalk:environment:process:default", OptionName: HealthCheckPath, Value: /health }
+          - !Ref "AWS::NoValue"
+        - !If
+          - ProdIsLoadBalanced
+          - { Namespace: "aws:autoscaling:asg", OptionName: MinSize, Value: "2" }
+          - !Ref "AWS::NoValue"
+        - !If
+          - ProdIsLoadBalanced
+          - { Namespace: "aws:autoscaling:asg", OptionName: MaxSize, Value: "4" }
+          - !Ref "AWS::NoValue"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: production }
+
+  # ------------------------------------------------------------------ CodeBuild
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${ProjectName}"
+      RetentionInDays: 14
+
+  CiBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-ci"
+      Description: Lint, tipado, pruebas unitarias/integración y empaquetado.
+      ServiceRole: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LabRoleName}"
+      Source: { Type: CODEPIPELINE, BuildSpec: buildspec.yml }
+      Artifacts: { Type: CODEPIPELINE }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+      Cache:
+        Type: S3
+        Location: !Sub "${ArtifactBucket}/codebuild-cache/ci"
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref BuildLogGroup, StreamName: ci }
+      TimeoutInMinutes: 15
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  SmokeTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-smoke-test"
+      Description: Verificación funcional post-despliegue contra el entorno real.
+      ServiceRole: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LabRoleName}"
+      Source: { Type: CODEPIPELINE, BuildSpec: buildspec-smoke.yml }
+      Artifacts: { Type: CODEPIPELINE }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: TARGET_URL, Value: "http://localhost", Type: PLAINTEXT }
+          - { Name: SMOKE_MODE, Value: read-only, Type: PLAINTEXT }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref BuildLogGroup, StreamName: smoke }
+      TimeoutInMinutes: 10
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # ------------------------------------------------------------------ Notificaciones
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub "${ProjectName}-pipeline-notifications"
+      Subscription:
+        - { Endpoint: !Ref NotificationEmail, Protocol: email }
+
+  NotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasNotificationEmail
+    Properties:
+      Topics: [!Ref NotificationTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref NotificationTopic
+
+  PipelineResultRule:
+    Type: AWS::Events::Rule
+    Condition: HasNotificationEmail
+    Properties:
+      Description: Notifica éxito o fallo de cada ejecución del pipeline.
+      EventPattern:
+        source: [aws.codepipeline]
+        detail-type: [CodePipeline Pipeline Execution State Change]
+        detail:
+          pipeline: [!Ref Pipeline]
+          state: [SUCCEEDED, FAILED]
+      Targets:
+        - Id: notify
+          Arn: !Ref NotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              pipeline: "$.detail.pipeline"
+              state: "$.detail.state"
+              execution: "$.detail.execution-id"
+            InputTemplate: '"Pipeline <pipeline> terminó con estado <state> (ejecución <execution>)."'
+
+  # ------------------------------------------------------------------ Pipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${ProjectName}-pipeline"
+      PipelineType: V2
+      RoleArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LabRoleName}"
+      ArtifactStore: { Type: S3, Location: !Ref ArtifactBucket }
+      Stages:
+        - Name: Source
+          Actions:
+            - !If
+              - UseCodeCommit
+              - Name: Source
+                ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeCommit, Version: "1" }
+                Configuration:
+                  RepositoryName: !GetAtt SourceRepository.Name
+                  BranchName: !Ref BranchName
+                  PollForSourceChanges: false
+                  OutputArtifactFormat: CODE_ZIP
+                OutputArtifacts: [{ Name: SourceOutput }]
+              - Name: Source
+                ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+                Configuration:
+                  ConnectionArn: !Ref GitHubConnectionArn
+                  FullRepositoryId: !Ref GitHubRepository
+                  BranchName: !Ref BranchName
+                  DetectChanges: true
+                  OutputArtifactFormat: CODE_ZIP
+                OutputArtifacts: [{ Name: SourceOutput }]
+
+        - Name: Build_and_Test
+          Actions:
+            - Name: Lint_Test_Package
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref CiBuildProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+
+        - Name: Deploy_Staging
+          Actions:
+            - Name: Deploy_EB_Staging
+              RunOrder: 1
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: ElasticBeanstalk, Version: "1" }
+              Configuration:
+                ApplicationName: !Ref EBApplication
+                EnvironmentName: !Ref StagingEnvironment
+              InputArtifacts: [{ Name: BuildOutput }]
+            - Name: Smoke_Test_Staging
+              RunOrder: 2
+              ActionTypeId: { Category: Test, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref SmokeTestProject
+                EnvironmentVariables: !Sub >-
+                  [{"name":"TARGET_URL","value":"http://${ProjectName}-staging-${AWS::AccountId}.${AWS::Region}.elasticbeanstalk.com","type":"PLAINTEXT"},
+                  {"name":"SMOKE_MODE","value":"full","type":"PLAINTEXT"}]
+              InputArtifacts: [{ Name: SourceOutput }]
+
+        - Name: Approval
+          Actions:
+            - Name: Approve_Production
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration:
+                CustomData: Staging superó el smoke test. Revise el entorno y apruebe el paso a producción.
+                ExternalEntityLink: !Sub "http://${ProjectName}-staging-${AWS::AccountId}.${AWS::Region}.elasticbeanstalk.com/docs"
+                NotificationArn: !If [HasNotificationEmail, !Ref NotificationTopic, !Ref "AWS::NoValue"]
+
+        - Name: Deploy_Production
+          Actions:
+            - Name: Deploy_EB_Production
+              RunOrder: 1
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: ElasticBeanstalk, Version: "1" }
+              Configuration:
+                ApplicationName: !Ref EBApplication
+                EnvironmentName: !Ref ProductionEnvironment
+              InputArtifacts: [{ Name: BuildOutput }]
+            - Name: Smoke_Test_Production
+              RunOrder: 2
+              ActionTypeId: { Category: Test, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref SmokeTestProject
+                EnvironmentVariables: !Sub >-
+                  [{"name":"TARGET_URL","value":"http://${ProjectName}-prod-${AWS::AccountId}.${AWS::Region}.elasticbeanstalk.com","type":"PLAINTEXT"},
+                  {"name":"SMOKE_MODE","value":"read-only","type":"PLAINTEXT"}]
+              InputArtifacts: [{ Name: SourceOutput }]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+Outputs:
+  StagingUrl:
+    Value: !Sub "http://${ProjectName}-staging-${AWS::AccountId}.${AWS::Region}.elasticbeanstalk.com"
+  StagingDocsUrl:
+    Value: !Sub "http://${ProjectName}-staging-${AWS::AccountId}.${AWS::Region}.elasticbeanstalk.com/docs"
+  ProductionUrl:
+    Value: !Sub "http://${ProjectName}-prod-${AWS::AccountId}.${AWS::Region}.elasticbeanstalk.com"
+  PipelineConsoleUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view"
+  CodeCommitGrcUrl:
+    Condition: UseCodeCommit
+    Description: URL para git-remote-codecommit (funciona con credenciales temporales del laboratorio).
+    Value: !Sub "codecommit::${AWS::Region}://${SourceRepository.Name}"
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket

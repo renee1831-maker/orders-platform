@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Plataforma de gestión de pedidos - infraestructura de ejecución para CI/CD con GitHub Actions:
+  bucket de artefactos, DynamoDB (staging/producción) y Elastic Beanstalk (staging/producción).
+  Diseñada para AWS Academy Sandbox (sin CodePipeline/CodeBuild y sin creación de roles IAM:
+  reutiliza LabRole / LabInstanceProfile).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Proyecto" }
+        Parameters: [ProjectName]
+      - Label: { default: "Roles del laboratorio (AWS Academy)" }
+        Parameters: [LabRoleName, LabInstanceProfileName]
+      - Label: { default: "Cómputo" }
+        Parameters: [SolutionStackName, InstanceType, ProductionEnvironmentType]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: orders-platform
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"
+    Description: Prefijo de todos los recursos (minúsculas, números y guiones).
+  LabRoleName:
+    Type: String
+    Default: LabRole
+  LabInstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+  SolutionStackName:
+    Type: String
+    Description: >-
+      Plataforma EB exacta, p. ej. "64bit Amazon Linux 2023 v4.x.y running Python 3.12".
+      scripts/deploy_infra.sh la resuelve automáticamente.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t2.micro]
+  ProductionEnvironmentType:
+    Type: String
+    Default: SingleInstance
+    AllowedValues: [SingleInstance, LoadBalanced]
+    Description: LoadBalanced crea un ALB y Auto Scaling (2-4 instancias) en producción.
+
+Conditions:
+  ProdIsLoadBalanced: !Equals [!Ref ProductionEnvironmentType, LoadBalanced]
+
+Resources:
+  # ------------------------------------------------------------------ Artefactos
+  # GitHub Actions sube aquí el ZIP de cada build; Elastic Beanstalk lo toma como versión.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-build-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub "${ArtifactBucket.Arn}/*"
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  # ------------------------------------------------------------------ Datos
+  StagingOrdersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${ProjectName}-orders-staging"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: entity_type, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi_entity_created_at
+          KeySchema:
+            - { AttributeName: entity_type, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: gsi_status_created_at
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      SSESpecification: { SSEEnabled: true }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: staging }
+
+  ProductionOrdersTable:
+    Type: AWS::DynamoDB::Table
+    # Los datos de producción sobreviven a un borrado accidental del stack.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${ProjectName}-orders-production"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: entity_type, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi_entity_created_at
+          KeySchema:
+            - { AttributeName: entity_type, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: gsi_status_created_at
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: production }
+
+  # ------------------------------------------------------------------ Elastic Beanstalk
+  EBApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: !Ref ProjectName
+      Description: API REST de gestión de pedidos (Python / FastAPI)
+      ResourceLifecycleConfig:
+        ServiceRole: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LabRoleName}"
+        VersionLifecycleConfig:
+          MaxCountRule:
+            Enabled: true
+            MaxCount: 20
+            DeleteSourceFromS3: true
+
+  StagingEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref EBApplication
+      EnvironmentName: !Sub "${ProjectName}-staging"
+      CNAMEPrefix: !Sub "${ProjectName}-staging-${AWS::AccountId}"
+      SolutionStackName: !Ref SolutionStackName
+      Tier: { Name: WebServer, Type: Standard }
+      OptionSettings:
+        - { Namespace: "aws:elasticbeanstalk:environment", OptionName: EnvironmentType, Value: SingleInstance }
+        - { Namespace: "aws:elasticbeanstalk:environment", OptionName: ServiceRole, Value: !Ref LabRoleName }
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: IamInstanceProfile, Value: !Ref LabInstanceProfileName }
+        # IMDSv2 + gp3 fuerzan Launch Templates (cuentas nuevas no admiten Launch Configurations).
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: DisableIMDSv1, Value: "true" }
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: RootVolumeType, Value: gp3 }
+        - { Namespace: "aws:ec2:instances", OptionName: InstanceTypes, Value: !Ref InstanceType }
+        - { Namespace: "aws:elasticbeanstalk:command", OptionName: DeploymentPolicy, Value: AllAtOnce }
+        - { Namespace: "aws:elasticbeanstalk:healthreporting:system", OptionName: SystemType, Value: enhanced }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: StreamLogs, Value: "true" }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: RetentionInDays, Value: "7" }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: DeleteOnTerminate, Value: "true" }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs:health", OptionName: HealthStreamingEnabled, Value: "true" }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: APP_ENV, Value: staging }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: REPOSITORY_BACKEND, Value: dynamodb }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: ORDERS_TABLE_NAME, Value: !Ref StagingOrdersTable }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: AWS_REGION, Value: !Ref "AWS::Region" }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: LOG_LEVEL, Value: INFO }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: ENABLE_DOCS, Value: "true" }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: staging }
+
+  ProductionEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref EBApplication
+      EnvironmentName: !Sub "${ProjectName}-production"
+      CNAMEPrefix: !Sub "${ProjectName}-prod-${AWS::AccountId}"
+      SolutionStackName: !Ref SolutionStackName
+      Tier: { Name: WebServer, Type: Standard }
+      OptionSettings:
+        - { Namespace: "aws:elasticbeanstalk:environment", OptionName: EnvironmentType, Value: !Ref ProductionEnvironmentType }
+        - { Namespace: "aws:elasticbeanstalk:environment", OptionName: ServiceRole, Value: !Ref LabRoleName }
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: IamInstanceProfile, Value: !Ref LabInstanceProfileName }
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: DisableIMDSv1, Value: "true" }
+        - { Namespace: "aws:autoscaling:launchconfiguration", OptionName: RootVolumeType, Value: gp3 }
+        - { Namespace: "aws:ec2:instances", OptionName: InstanceTypes, Value: !Ref InstanceType }
+        # Immutable: instancias nuevas en paralelo; si fallan, la versión anterior sigue sirviendo.
+        - { Namespace: "aws:elasticbeanstalk:command", OptionName: DeploymentPolicy, Value: Immutable }
+        - { Namespace: "aws:elasticbeanstalk:healthreporting:system", OptionName: SystemType, Value: enhanced }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: StreamLogs, Value: "true" }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: RetentionInDays, Value: "30" }
+        - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs:health", OptionName: HealthStreamingEnabled, Value: "true" }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: APP_ENV, Value: production }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: REPOSITORY_BACKEND, Value: dynamodb }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: ORDERS_TABLE_NAME, Value: !Ref ProductionOrdersTable }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: AWS_REGION, Value: !Ref "AWS::Region" }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: LOG_LEVEL, Value: INFO }
+        - { Namespace: "aws:elasticbeanstalk:application:environment", OptionName: ENABLE_DOCS, Value: "false" }
+        - !If
+          - ProdIsLoadBalanced
+          - { Namespace: "aws:elasticbeanstalk:environment", OptionName: LoadBalancerType, Value: application }
+          - !Ref "AWS::NoValue"
+        - !If
+          - ProdIsLoadBalanced
+          - { Namespace: "aws:elasticbeanstalk:environment:process:default", OptionName: HealthCheckPath, Value: /health }
+          - !Ref "AWS::NoValue"
+        - !If
+          - ProdIsLoadBalanced
+          - { Namespace: "aws:autoscaling:asg", OptionName: MinSize, Value: "2" }
+          - !Ref "AWS::NoValue"
+        - !If
+          - ProdIsLoadBalanced
+          - { Namespace: "aws:autoscaling:asg", OptionName: MaxSize, Value: "4" }
+          - !Ref "AWS::NoValue"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: production }
+
+Outputs:
+  StagingUrl:
+    Value: !Sub "http://${ProjectName}-staging-${AWS::AccountId}.${AWS::Region}.elasticbeanstalk.com"
+  StagingDocsUrl:
+    Value: !Sub "http://${ProjectName}-staging-${AWS::AccountId}.${AWS::Region}.elasticbeanstalk.com/docs"
+  ProductionUrl:
+    Value: !Sub "http://${ProjectName}-prod-${AWS::AccountId}.${AWS::Region}.elasticbeanstalk.com"
+  ApplicationName:
+    Value: !Ref EBApplication
+  StagingEnvironmentName:
+    Value: !Ref StagingEnvironment
+  ProductionEnvironmentName:
+    Value: !Ref ProductionEnvironment
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket

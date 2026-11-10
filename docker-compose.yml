@@ -1,0 +1,29 @@
+# Entorno local idéntico al de AWS (DynamoDB Local en lugar de DynamoDB).
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.3
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports: ["8001:8000"]
+
+  init-table:
+    build: .
+    command: ["python", "-m", "scripts.create_local_table"]
+    environment: &aws-local
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_REGION: us-east-1
+      DYNAMODB_ENDPOINT_URL: http://dynamodb:8000
+      ORDERS_TABLE_NAME: orders
+    depends_on: [dynamodb]
+    restart: on-failure
+
+  api:
+    build: .
+    ports: ["8080:8000"]
+    environment:
+      <<: *aws-local
+      APP_ENV: local
+      REPOSITORY_BACKEND: dynamodb
+    depends_on:
+      init-table:
+        condition: service_completed_successfully

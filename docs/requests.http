@@ -1,0 +1,36 @@
+### Variables (REST Client de VS Code / JetBrains HTTP Client)
+@base = http://localhost:8000
+
+### Health
+GET {{base}}/health
+
+### Crear pedido
+POST {{base}}/api/v1/orders
+Content-Type: application/json
+
+{
+  "customer": { "name": "Ana Gómez", "email": "ana@example.com", "phone": "+57 3001234567" },
+  "items": [
+    { "sku": "TEC-01", "name": "Teclado mecánico", "quantity": 1, "unit_price": "320000.00" },
+    { "sku": "MOU-02", "name": "Mouse inalámbrico", "quantity": 2, "unit_price": "85000.00" }
+  ],
+  "shipping_address": {
+    "street": "Calle 100 # 10-20", "city": "Bogotá", "state": "Cundinamarca",
+    "postal_code": "110111", "country": "Colombia"
+  }
+}
+
+### Listar (más recientes primero)
+GET {{base}}/api/v1/orders?limit=10
+
+### Filtrar por estado y rango de fechas, orden ascendente
+GET {{base}}/api/v1/orders?status=PENDING&created_from=2026-01-01T00:00:00Z&sort=created_at
+
+### Consultar uno (reemplace el id)
+GET {{base}}/api/v1/orders/REEMPLAZAR-ID
+
+### Cambiar estado
+PATCH {{base}}/api/v1/orders/REEMPLAZAR-ID/status
+Content-Type: application/json
+
+{ "status": "IN_PROCESS", "note": "Pedido en alistamiento" }

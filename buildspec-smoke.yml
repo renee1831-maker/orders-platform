@@ -1,0 +1,11 @@
+# Verificación post-despliegue. TARGET_URL y SMOKE_MODE los inyecta CodePipeline.
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+  build:
+    commands:
+      - echo "Verificando $TARGET_URL (modo $SMOKE_MODE)"
+      - python scripts/smoke_test.py --url "$TARGET_URL" --mode "${SMOKE_MODE:-read-only}"
