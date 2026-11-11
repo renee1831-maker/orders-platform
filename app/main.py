@@ -30,7 +30,7 @@ def create_app(
     configure_logging(settings.log_level)
 
     app = FastAPI(
-        title="Orders API.Plataforma de Gestión de Pedidos",
+        title="Orders API.Plataforma 2 de Gestión de Pedidos",
         description="API REST de gestión de pedidos",
         version=get_build_info()["commit"],
         docs_url="/docs" if settings.enable_docs else None,
